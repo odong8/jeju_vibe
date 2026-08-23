@@ -1,0 +1,20 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "pnpm run build:vercel",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/generate.ts": {
+      "includeFiles": "api/_lib/**"
+    },
+    "api/synthesize.ts": {
+      "includeFiles": "api/_lib/**"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

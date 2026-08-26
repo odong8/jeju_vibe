@@ -1,2 +1,1 @@
-print("Hello World!")
-print("I'm jayoung")
+라즈베리파이 소개 웹페이지를 만들어줘

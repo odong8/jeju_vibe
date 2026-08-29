@@ -120,7 +120,8 @@ def generate_frames():
     while True:
         # Picamera2에서 프레임 캡처 후 BGR 컬러 변환
         frame = picam2.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        #frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame = cv2.flip(frame, -1)
 
         frame_count += 1
 

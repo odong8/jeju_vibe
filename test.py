@@ -1,3 +1,7 @@
+from picamera2 import Picamera2
+import numpy as np
+
+
 picam2 = Picamera2()
 picam2.configure(picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"}))
 picam2.start()

@@ -1,38 +1,14 @@
-cd ~/smart_sort
-python3 app.py
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"}))
+picam2.start()
 
-* 접속 주소: `http://localhost:5000` 또는 `http://<라즈베리파이_IP>:5000`
 
-### 3.2 자주 발생하는 오류 (Troubleshooting)
-1. **`ModuleNotFoundError: No module named 'cv2'`**: `sudo apt install python3-opencv` 실행
-2. **권한 오류**: `sudo python3 app.py` 명령으로 권한 상승 후 실행
-3. **카메라 인식 불가**: `sudo raspi-config` -> `Interface Options` -> `Legacy Camera` 활성화 후 재부팅
 
----
----
+# 프레임 읽어오는 함수 내부 (cap.read() 대신 사용)
+# ret, frame = cap.read()  <-- 기존
+frame = picam2.capture_array() # <-- 변경
+frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-# 📹 [제출 항목 3] 시연 동영상 촬영 가이드
 
-## 1. 동영상 추천 구도
-모니터의 **Flask 웹 대시보드 화면**과 **라즈베리파이 실물 부품(모듈들)**이 한 앵글 안에 모두 들어오도록 카메라를 고정합니다.
 
-## 2. 시연 순서 (1~2분 분량)
-1. **[0:00 ~ 0:15]** 프로젝트 소개 및 각 모듈(파이카메라, 초음파 센서 모듈, LED 모듈, 부저 모듈) 지목.
-2. **[0:15 ~ 0:30]** 손을 초음파 센서 모듈 앞으로 가져가 웹 화면의 거리가 20cm 이하로 줄어드는 것 시연.
-3. **[0:30 ~ 1:00]** 페트병(또는 사람)을 카메라에 비추어 AI 인식 상자(`bottle`), LED 모듈 점등, 부저 모듈 소리, 웹 상태 변경을 동시 시연.
-4. **[1:00 ~ 1:20]** 웹 대시보드의 `[🟢 LED 모듈 테스트]`, `[🔔 부저 모듈 테스트]` 버튼을 클릭해 실물 모듈이 원격 작동하는 모습 확인.
-5. **[1:20 ~ 1:30]** 마무리 인사.
-```eof
 
-우측 가이드 문서에 각 모듈의 정확한 핀 이름을 적용해 두었습니다.
-
-* **LED 모듈 (`IN`, `VCC`, `GND`)**: 
-  - `IN` ➡️ **Pin 11 (BCM 17)**
-  - `VCC` ➡️ **Pin 1 (3.3V)**
-  - `GND` ➡️ **Pin 9 (GND)**
-* **부저 모듈 (`S`, `+`, `-`)**: 
-  - `S` ➡️ **Pin 12 (BCM 18)**
-  - `+` (중앙) ➡️ **Pin 4 (5V)**
-  - `-` ➡️ **Pin 14 (GND)**
-
-이제 표에 맞춰 암-수 점퍼 선으로 1:1 연결만 해주시면 바로 정상 작동합니다! 추가로 궁금한 점이 있으시면 편하게 알려주세요.

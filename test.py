@@ -15,24 +15,29 @@ PIN_TRIG = 23
 PIN_ECHO = 24
 PIN_LED_GREEN = 17  # 경고등 LED
 PIN_BUZZER = 18     # 2핀 부저 (+)
+PIN_SERVO = 25      # 허수아비 구동 서보모터
 
-GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
 GPIO.setup(PIN_TRIG, GPIO.OUT)
 GPIO.setup(PIN_ECHO, GPIO.IN)
 GPIO.setup(PIN_LED_GREEN, GPIO.OUT)
 GPIO.setup(PIN_BUZZER, GPIO.OUT)
+GPIO.setup(PIN_SERVO, GPIO.OUT)
 
 GPIO.output(PIN_LED_GREEN, GPIO.LOW)
 GPIO.output(PIN_BUZZER, GPIO.LOW)
+
+# 서보모터 PWM 초기화 (50Hz)
+servo_pwm = GPIO.PWM(PIN_SERVO, 50)
+servo_pwm.start(0)
 
 # ==========================================
 # 2. AI 모델 로딩 (MobileNet-SSD)
 # ==========================================
 PROTOTXT = "models/deploy.prototxt"
 MODEL = "models/MobileNetSSD_deploy.caffemodel"
-CONFIDENCE_THRESHOLD = 0.45  # 오인식 방지를 위해 0.45로 상향
+CONFIDENCE_THRESHOLD = 0.45  # 오인식 방지를 위해 0.45로 설정
 
 CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
@@ -66,7 +71,7 @@ picam2.configure(picam2.create_video_configuration(main={"size": (400, 300), "fo
 picam2.start()
 
 # ==========================================
-# 4. 2핀 부저 PWM 제어 함수
+# 4. 2핀 부저 PWM 및 서보모터 허수아비 제어 함수
 # ==========================================
 def beep_pwm(duration=0.1, freq=2700):
     try:
@@ -76,6 +81,22 @@ def beep_pwm(duration=0.1, freq=2700):
         pwm.stop()
     except Exception:
         GPIO.output(PIN_BUZZER, GPIO.LOW)
+
+def move_scarecrow():
+    """허수아비를 좌우로 회전시키는 서보모터 구동 함수"""
+    try:
+        # 0도 -> 180도 -> 0도 왕복 동작 (DutyCycle: 2.5% ~ 12.5%)
+        for _ in range(2):
+            servo_pwm.ChangeDutyCycle(2.5)   # 0도 (좌측)
+            time.sleep(0.25)
+            servo_pwm.ChangeDutyCycle(12.5)  # 180도 (우측)
+            time.sleep(0.25)
+        
+        servo_pwm.ChangeDutyCycle(7.5)   # 90도 (정면 원위치)
+        time.sleep(0.2)
+        servo_pwm.ChangeDutyCycle(0)     # 신호 차단 (서보 떨림 방지)
+    except Exception as e:
+        print(f"[SERVO ERROR] {e}")
 
 def trigger_wildlife_deterrent():
     global is_alerting, last_alert_time
@@ -87,6 +108,10 @@ def trigger_wildlife_deterrent():
         is_alerting = True
         last_alert_time = time.strftime("%H:%M:%S")
         
+        # 1. 서보모터 허수아비 회전 동작 (별도 스레드 동시 실행)
+        threading.Thread(target=move_scarecrow, daemon=True).start()
+
+        # 2. LED 및 부저 경고음 동시 작동
         for _ in range(3):
             GPIO.output(PIN_LED_GREEN, GPIO.HIGH)
             beep_pwm(0.1, 2700)
@@ -97,7 +122,7 @@ def trigger_wildlife_deterrent():
         beep_pwm(0.4, 3000)
         GPIO.output(PIN_LED_GREEN, GPIO.LOW)
         
-        time.sleep(1.0)
+        time.sleep(0.5)
         is_alerting = False
 
     threading.Thread(target=alert_thread, daemon=True).start()
@@ -157,7 +182,7 @@ def camera_capture_loop():
     global latest_raw_frame
     while True:
         frame = picam2.capture_array()
-        #frame = cv2.flip(frame, -1)
+        # frame = cv2.flip(frame, -1)
         with frame_lock:
             latest_raw_frame = frame.copy()
         time.sleep(0.01)
@@ -196,10 +221,10 @@ def ai_inference_loop():
                     box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                     (startX, startY, endX, endY) = box.astype("int")
 
-                    # 1. 사람 감지 시 (파란색 박스 & 경보 차단 플래그 설정)
+                    # 1. 사람 감지 시 (주황색 박스 & 경보/허수아비 차단 플래그 설정)
                     if label_name == "person":
                         person_detected = True
-                        color = (255, 165, 0)  # 주황/파랑 계열 (안전)
+                        color = (255, 165, 0)
                         cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
                         cv2.putText(frame, f"Person: {confidence*100:.0f}%", (startX, startY - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -209,7 +234,7 @@ def ai_inference_loop():
                     elif label_name in ANIMAL_CLASSES:
                         animal_detected = True
                         detected_animal_name = label_name
-                        color = (0, 0, 255)  # 빨간색 (퇴치 대상)
+                        color = (0, 0, 255)
                         cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
                         cv2.putText(frame, f"{label_name}: {confidence*100:.0f}%", (startX, startY - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -225,14 +250,14 @@ def ai_inference_loop():
 
             detected_object = curr_obj
 
-            # --- 경보 제어 핵심 로직 ---
-            # 1. 사람이 카메라 화면에 감지되면 무조건 경보 안 울림 (사람 보호)
+            # --- 경보 및 허수아비 제어 핵심 로직 ---
+            # 1. 사람이 카메라 화면에 감지되면 무조건 경보/허수아비 작동 차단 (사람 보호)
             if person_detected:
                 system_status = "👤 사람 감지됨 (안전)"
             
-            # 2. 사람이 없고, 30cm 이내에 동물이 다가온 경우에만 퇴치 작동!
+            # 2. 사람이 없고, 30cm 이내에 동물이 다가온 경우 3단 퇴치 작동 (LED + 부저 + 허수아비)
             elif animal_detected and current_distance <= 30.0:
-                system_status = f"🚨 경보! 유해 동물 [{detected_animal_name}] 접근 탐지 (퇴치 작동)"
+                system_status = f"🚨 경보! 유해 동물 [{detected_animal_name}] 접근 탐지 (허수아비&사이렌 작동)"
                 trigger_wildlife_deterrent()
 
             # 3. 그 외 기본 상태
@@ -285,6 +310,8 @@ HTML_TEMPLATE = """
         button:hover { background: #2ecc71; }
         button.btn-buzzer { background: #e67e22; }
         button.btn-buzzer:hover { background: #f39c12; }
+        button.btn-servo { background: #2980b9; }
+        button.btn-servo:hover { background: #3498db; }
     </style>
     <script>
         function updateStatus() {
@@ -301,6 +328,7 @@ HTML_TEMPLATE = """
 
         function triggerLed() { fetch('/api/control/led'); }
         function triggerBuzzer() { fetch('/api/control/buzzer'); }
+        function triggerScarecrow() { fetch('/api/control/scarecrow'); }
     </script>
 </head>
 <body>
@@ -326,8 +354,9 @@ HTML_TEMPLATE = """
                     <small style="color:#8a99ad;">최근 퇴치 작동 시간: <span id="time">-</span></small>
                 </div>
                 <div class="btn-group">
-                    <button onclick="triggerLed()">🟢 경고등 점검</button>
-                    <button class="btn-buzzer" onclick="triggerBuzzer()">🔔 퇴치 사이렌 점검</button>
+                    <button onclick="triggerLed()">🟢 경고등</button>
+                    <button class="btn-buzzer" onclick="triggerBuzzer()">🔔 사이렌</button>
+                    <button class="btn-servo" onclick="triggerScarecrow()">🤖 허수아비</button>
                 </div>
             </div>
         </div>
@@ -363,10 +392,16 @@ def control_buzzer():
     beep_pwm(0.2, 2700)
     return jsonify({'result': 'success'})
 
+@app.route('/api/control/scarecrow')
+def control_scarecrow():
+    threading.Thread(target=move_scarecrow, daemon=True).start()
+    return jsonify({'result': 'success'})
+
 if __name__ == '__main__':
     try:
         print("[INFO] AI 야생 동물 감시 고속 웹 서버 시작: [http://0.0.0.0:5000](http://0.0.0.0:5000)")
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     finally:
+        servo_pwm.stop()
         picam2.stop()
         GPIO.cleanup()

@@ -9,6 +9,8 @@ from picamera2 import Picamera2
 # ==========================================
 # 1. GPIO 핀 설정
 # ==========================================
+GPIO.setmode(GPIO.BCM)
+
 PIN_TRIG = 23
 PIN_ECHO = 24
 PIN_LED_GREEN = 17  # 경고등 LED
@@ -226,7 +228,7 @@ def ai_inference_loop():
             # --- 경보 제어 핵심 로직 ---
             # 1. 사람이 카메라 화면에 감지되면 무조건 경보 안 울림 (사람 보호)
             if person_detected:
-                system_status = "👤 사람 감지됨 (퇴치 소리 차단)"
+                system_status = "👤 사람 감지됨 (안전)"
             
             # 2. 사람이 없고, 30cm 이내에 동물이 다가온 경우에만 퇴치 작동!
             elif animal_detected and current_distance <= 30.0:

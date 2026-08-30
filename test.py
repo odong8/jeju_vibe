@@ -30,19 +30,19 @@ GPIO.output(PIN_BUZZER, GPIO.LOW)
 # ==========================================
 PROTOTXT = "models/deploy.prototxt"
 MODEL = "models/MobileNetSSD_deploy.caffemodel"
-CONFIDENCE_THRESHOLD = 0.40
+CONFIDENCE_THRESHOLD = 0.45  # 오인식 방지를 위해 0.45로 상향
 
 CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
            "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
            "sofa", "train", "tvmonitor"]
 
-# 사람(person)을 제외하고 동물(bird, cat, dog)만 퇴치 대상으로 지정
-TARGET_CLASSES = ["bird", "cat", "dog"]
+# 퇴치 대상 동물 (조류, 고양이, 개)
+ANIMAL_CLASSES = ["bird", "cat", "dog"]
 
-print("[INFO] AI 야생 동물 감시 모델 로딩 중...")
+print("[INFO] AI 야생 동물 및 사람 감지 모델 로딩 중...")
 net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
-print("[INFO] AI 야생 동물 감시 모델 로딩 완료!")
+print("[INFO] AI 모델 로딩 완료!")
 
 # ==========================================
 # 3. 전역 공유 변수 및 카메라 설정
@@ -51,7 +51,7 @@ app = Flask(__name__)
 
 current_distance = 0.0
 detected_object = "없음"
-system_status = "🌿 안전 구역 (동물 감시 중)"
+system_status = "🌿 안전 구역 (감시 중)"
 last_alert_time = "-"
 is_alerting = False
 
@@ -163,7 +163,7 @@ def camera_capture_loop():
 threading.Thread(target=camera_capture_loop, daemon=True).start()
 
 # ==========================================
-# 7. 비동기 AI 추론 백그라운드 스레드
+# 7. 비동기 AI 추론 백그라운드 스레드 (사람 예외 처리 적용)
 # ==========================================
 def ai_inference_loop():
     global latest_processed_frame, detected_object, system_status
@@ -180,7 +180,9 @@ def ai_inference_loop():
             net.setInput(blob)
             detections = net.forward()
 
-            found_target = False
+            person_detected = False
+            animal_detected = False
+            detected_animal_name = ""
             curr_obj = "없음"
 
             for i in range(0, detections.shape[2]):
@@ -192,29 +194,49 @@ def ai_inference_loop():
                     box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                     (startX, startY, endX, endY) = box.astype("int")
 
-                    # target_classes (bird, cat, dog)인 경우만 빨간 박스로 표시 및 퇴치 작동
-                    if label_name in TARGET_CLASSES:
+                    # 1. 사람 감지 시 (파란색 박스 & 경보 차단 플래그 설정)
+                    if label_name == "person":
+                        person_detected = True
+                        color = (255, 165, 0)  # 주황/파랑 계열 (안전)
+                        cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
+                        cv2.putText(frame, f"Person: {confidence*100:.0f}%", (startX, startY - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        curr_obj = f"person ({confidence * 100:.0f}%)"
+
+                    # 2. 동물 감지 시 (빨간색 박스)
+                    elif label_name in ANIMAL_CLASSES:
+                        animal_detected = True
+                        detected_animal_name = label_name
                         color = (0, 0, 255)  # 빨간색 (퇴치 대상)
+                        cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
+                        cv2.putText(frame, f"{label_name}: {confidence*100:.0f}%", (startX, startY - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        curr_obj = f"{label_name} ({confidence * 100:.0f}%)"
+
+                    # 3. 기타 일반 사물 (초록색 박스)
                     else:
-                        color = (0, 255, 0)  # 초록색 (일반 물체/사람)
-
-                    cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
-                    text = f"{label_name}: {confidence * 100:.1f}%"
-                    cv2.putText(frame, text, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                    curr_obj = f"{label_name} ({confidence * 100:.0f}%)"
-
-                    # 30cm 이내 접근 + 동물이 감지된 경우에만 사이렌 작동
-                    if current_distance <= 30.0 and label_name in TARGET_CLASSES:
-                        found_target = True
-                        system_status = f"🚨 경보! 유해 동물 [{label_name}] 접근 탐지 (퇴치 작동)"
-                        trigger_wildlife_deterrent()
+                        color = (0, 255, 0)
+                        cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
+                        cv2.putText(frame, f"{label_name}: {confidence*100:.0f}%", (startX, startY - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        curr_obj = f"{label_name} ({confidence * 100:.0f}%)"
 
             detected_object = curr_obj
 
-            if not found_target:
+            # --- 경보 제어 핵심 로직 ---
+            # 1. 사람이 카메라 화면에 감지되면 무조건 경보 안 울림 (사람 보호)
+            if person_detected:
+                system_status = "👤 사람 감지됨 (퇴치 소리 차단)"
+            
+            # 2. 사람이 없고, 30cm 이내에 동물이 다가온 경우에만 퇴치 작동!
+            elif animal_detected and current_distance <= 30.0:
+                system_status = f"🚨 경보! 유해 동물 [{detected_animal_name}] 접근 탐지 (퇴치 작동)"
+                trigger_wildlife_deterrent()
+
+            # 3. 그 외 기본 상태
+            else:
                 if current_distance <= 30.0:
-                    system_status = "⚠️ 객체/사람 접근 중 (동물 여부 분석 중...)"
+                    system_status = "⚠️ 물체/사람 접근 중 (감시 중...)"
                 else:
                     system_status = "🌿 안전 구역 (동물 감시 중)"
 

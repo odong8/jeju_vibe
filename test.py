@@ -30,7 +30,7 @@ GPIO.output(PIN_BUZZER, GPIO.LOW)
 # ==========================================
 PROTOTXT = "models/deploy.prototxt"
 MODEL = "models/MobileNetSSD_deploy.caffemodel"
-CONFIDENCE_THRESHOLD = 0.45
+CONFIDENCE_THRESHOLD = 0.40
 
 CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
@@ -44,7 +44,7 @@ net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
 print("[INFO] AI 생태 감시 모델 로딩 완료!")
 
 # ==========================================
-# 3. 전역 상태 및 카메라 초기화
+# 3. 전역 공유 변수 및 카메라 설정
 # ==========================================
 app = Flask(__name__)
 
@@ -53,19 +53,22 @@ detected_object = "없음"
 system_status = "🌿 안전 구역 (감시 중)"
 last_alert_time = "-"
 is_alerting = False
-latest_frame = None
+
+latest_raw_frame = None  # 원본 캡처 프레임
+latest_processed_frame = None  # AI 결과 오버레이 프레임
+frame_lock = threading.Lock()
 
 picam2 = Picamera2()
 picam2.configure(picam2.create_video_configuration(main={"size": (400, 300), "format": "RGB888"}))
 picam2.start()
 
 # ==========================================
-# 4. 2핀 부저 PWM 음량 극대화 제어 함수
+# 4. 2핀 부저 PWM 제어 함수
 # ==========================================
 def beep_pwm(duration=0.1, freq=2700):
     try:
         pwm = GPIO.PWM(PIN_BUZZER, freq)
-        pwm.start(50)  # 50% 듀티 사이클로 최고 음량 출력
+        pwm.start(50)
         time.sleep(duration)
         pwm.stop()
     except Exception:
@@ -81,41 +84,40 @@ def trigger_wildlife_deterrent():
         is_alerting = True
         last_alert_time = time.strftime("%H:%M:%S")
         
-        # 3회 고주파 피에조 사이렌 알림 (2.7kHz 삐- 삐- 삐-)
         for _ in range(3):
             GPIO.output(PIN_LED_GREEN, GPIO.HIGH)
-            beep_pwm(0.12, 2700)
+            beep_pwm(0.1, 2700)
             GPIO.output(PIN_LED_GREEN, GPIO.LOW)
-            time.sleep(0.08)
+            time.sleep(0.05)
             
         GPIO.output(PIN_LED_GREEN, GPIO.HIGH)
-        beep_pwm(0.5, 3000)  # 마지막 3kHz 사이렌
+        beep_pwm(0.4, 3000)
         GPIO.output(PIN_LED_GREEN, GPIO.LOW)
         
-        time.sleep(1.5)  # 쿨타임
+        time.sleep(1.0)
         is_alerting = False
 
     threading.Thread(target=alert_thread, daemon=True).start()
 
 # ==========================================
-# 5. 중앙값(Median) 필터 적용 정밀 초음파 스레드
+# 5. 초고속 반응 초음파 센서 스레드
 # ==========================================
 def measure_single_distance():
     GPIO.output(PIN_TRIG, False)
     time.sleep(0.000002)
     GPIO.output(PIN_TRIG, True)
-    time.sleep(0.00001)
+    time.sleep(0.000008)
     GPIO.output(PIN_TRIG, False)
 
     pulse_start = time.time()
-    timeout = pulse_start + 0.025
+    timeout = pulse_start + 0.015
     while GPIO.input(PIN_ECHO) == 0:
         pulse_start = time.time()
         if pulse_start > timeout:
             return None
 
     pulse_end = time.time()
-    timeout = pulse_end + 0.025
+    timeout = pulse_end + 0.015
     while GPIO.input(PIN_ECHO) == 1:
         pulse_end = time.time()
         if pulse_end > timeout:
@@ -131,41 +133,54 @@ def sensor_loop():
     global current_distance
     while True:
         samples = []
-        for _ in range(5):
+        for _ in range(3):  # 3회 초고속 측정
             d = measure_single_distance()
             if d is not None:
                 samples.append(d)
-            time.sleep(0.01)
+            time.sleep(0.005)
 
         if samples:
             samples.sort()
-            median_dist = samples[len(samples) // 2]
-            current_distance = round(median_dist, 1)
+            current_distance = round(samples[len(samples) // 2], 1)
 
-        time.sleep(0.1)
+        time.sleep(0.03)  # 0.03초 주기 갱신
 
 threading.Thread(target=sensor_loop, daemon=True).start()
 
 # ==========================================
-# 6. 고속 카메라 Capture 및 AI 감지 루프
+# 6. 실시간 카메라 Capturing 스레드 (30 FPS 고속)
 # ==========================================
-def camera_ai_loop():
-    global latest_frame, detected_object, system_status
-    frame_count = 0
-
+def camera_capture_loop():
+    global latest_raw_frame
     while True:
         frame = picam2.capture_array()
         #frame = cv2.flip(frame, -1)
-        (h, w) = frame.shape[:2]
+        with frame_lock:
+            latest_raw_frame = frame.copy()
+        time.sleep(0.01)
 
-        frame_count += 1
-        if frame_count % 2 == 0:
+threading.Thread(target=camera_capture_loop, daemon=True).start()
+
+# ==========================================
+# 7. 비동기 AI 추론 백그라운드 스레드
+# ==========================================
+def ai_inference_loop():
+    global latest_processed_frame, detected_object, system_status
+
+    while True:
+        frame = None
+        with frame_lock:
+            if latest_raw_frame is not None:
+                frame = latest_raw_frame.copy()
+
+        if frame is not None:
+            (h, w) = frame.shape[:2]
             blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
             net.setInput(blob)
             detections = net.forward()
 
             found_target = False
-            detected_object = "없음"
+            curr_obj = "없음"
 
             for i in range(0, detections.shape[2]):
                 confidence = detections[0, 0, i, 2]
@@ -181,12 +196,14 @@ def camera_ai_loop():
                     text = f"{label_name}: {confidence * 100:.1f}%"
                     cv2.putText(frame, text, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                    detected_object = f"{label_name} ({confidence * 100:.0f}%)"
+                    curr_obj = f"{label_name} ({confidence * 100:.0f}%)"
 
                     if current_distance <= 30.0 and label_name in TARGET_CLASSES:
                         found_target = True
                         system_status = f"🚨 경보! [{label_name}] 접근 탐지 (퇴치 작동)"
                         trigger_wildlife_deterrent()
+
+            detected_object = curr_obj
 
             if not found_target:
                 if current_distance <= 30.0:
@@ -194,23 +211,23 @@ def camera_ai_loop():
                 else:
                     system_status = "🌿 안전 구역 (감시 중)"
 
-        ret, buffer = cv2.imencode('.jpg', frame)
-        if ret:
-            latest_frame = buffer.tobytes()
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if ret:
+                latest_processed_frame = buffer.tobytes()
 
-        time.sleep(0.01)
+        time.sleep(0.03)  # AI 분석 주기
 
-threading.Thread(target=camera_ai_loop, daemon=True).start()
+threading.Thread(target=ai_inference_loop, daemon=True).start()
 
 def generate_frames():
     while True:
-        if latest_frame is not None:
+        if latest_processed_frame is not None:
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + latest_frame + b'\r\n')
-        time.sleep(0.04)
+                   b'Content-Type: image/jpeg\r\n\r\n' + latest_processed_frame + b'\r\n')
+        time.sleep(0.03)
 
 # ==========================================
-# 7. Flask 웹 모니터링 대시보드
+# 8. Flask 웹 모니터링 대시보드 (100ms 반응속도)
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -249,7 +266,7 @@ HTML_TEMPLATE = """
                     document.getElementById('time').innerText = data.last_time || '-';
                 });
         }
-        setInterval(updateStatus, 300);
+        setInterval(updateStatus, 100); // 0.1초 고속 업데이트
 
         function triggerLed() { fetch('/api/control/led'); }
         function triggerBuzzer() { fetch('/api/control/buzzer'); }
@@ -312,12 +329,12 @@ def control_led():
 
 @app.route('/api/control/buzzer')
 def control_buzzer():
-    beep_pwm(0.3, 2700)
+    beep_pwm(0.2, 2700)
     return jsonify({'result': 'success'})
 
 if __name__ == '__main__':
     try:
-        print("[INFO] AI 생태 감시 웹 서버 시작: [http://0.0.0.0:5000](http://0.0.0.0:5000)")
+        print("[INFO] AI 생태 감시 고속 웹 서버 시작: http://0.0.0.0:5000")
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     finally:
         picam2.stop()

@@ -11,8 +11,8 @@ from picamera2 import Picamera2
 # ==========================================
 PIN_TRIG = 23
 PIN_ECHO = 24
-PIN_LED_GREEN = 17  # LED 모듈 'IN' 핀
-PIN_BUZZER = 18     # 부저 모듈 'S' 핀
+PIN_LED_GREEN = 17
+PIN_BUZZER = 18
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
@@ -52,7 +52,6 @@ current_distance = 0.0
 detected_object = "없음"
 ai_status = "대기 중..."
 last_detected_time = ""
-is_alerting = False  # 알림 중복 실행 방지 플래그
 
 # Picamera2 초기화 및 설정
 picam2 = Picamera2()
@@ -60,7 +59,7 @@ picam2.configure(picam2.create_video_configuration(main={"size": (320, 240), "fo
 picam2.start()
 
 # ==========================================
-# 4. 부저 & LED 모듈 제어 함수 (중복 호출 방지 적용)
+# 4. 부저 & LED 모듈 제어 함수
 # ==========================================
 def beep(duration=0.1):
     GPIO.output(PIN_BUZZER, GPIO.HIGH)
@@ -68,63 +67,44 @@ def beep(duration=0.1):
     GPIO.output(PIN_BUZZER, GPIO.LOW)
 
 def trigger_success_alert():
-    global is_alerting
-    if is_alerting:
-        return  # 이미 알림이 울리는 중이면 추가 실행 안 함
-
     def alert_thread():
-        global is_alerting
-        is_alerting = True
         GPIO.output(PIN_LED_GREEN, GPIO.HIGH)
         beep(0.1)
         time.sleep(0.1)
         beep(0.1)
-        time.sleep(1.0)
+        time.sleep(1.5)
         GPIO.output(PIN_LED_GREEN, GPIO.LOW)
-        time.sleep(1.0)  # 알림 후 1초간 쿨타임 부여
-        is_alerting = False
-
     threading.Thread(target=alert_thread, daemon=True).start()
 
 # ==========================================
-# 5. 초음파 센서 모듈 측정 스레드 (오류 수정 완결판)
+# 5. 초음파 센서 모듈 측정 스레드
 # ==========================================
 def sensor_loop():
     global current_distance
     while True:
         try:
-            # Trig 신호 전송 (10us High)
-            GPIO.output(PIN_TRIG, False)
-            time.sleep(0.000002)
             GPIO.output(PIN_TRIG, True)
             time.sleep(0.00001)
             GPIO.output(PIN_TRIG, False)
 
-            # Echo 핀 1(High) 전환 대기
-            pulse_start = time.time()
-            timeout_start = pulse_start + 0.03
+            start_time = time.time()
+            stop_time = time.time()
+
+            timeout = start_time + 0.04
             while GPIO.input(PIN_ECHO) == 0:
-                pulse_start = time.time()
-                if pulse_start > timeout_start:
+                start_time = time.time()
+                if start_time > timeout:
                     break
 
-            # Echo 핀 0(Low) 전환 대기
-            pulse_end = time.time()
-            timeout_end = pulse_end + 0.03
             while GPIO.input(PIN_ECHO) == 1:
-                pulse_end = time.time()
-                if pulse_end > timeout_end:
+                stop_time = time.time()
+                if stop_time > timeout:
                     break
 
-            # 정상적으로 pulse 신호가 수신된 경우에만 거리 측정
-            if pulse_end > pulse_start and (pulse_end - pulse_start) < 0.03:
-                duration = pulse_end - pulse_start
-                dist = (duration * 34300) / 2
-                # HC-SR04 유효 거리범위 (2cm ~ 300cm)
-                if 2.0 <= dist <= 300.0:
-                    current_distance = round(dist, 1)
-
-            time.sleep(0.15)
+            elapsed = stop_time - start_time
+            distance = (elapsed * 34300) / 2
+            current_distance = round(distance, 1)
+            time.sleep(0.2)
         except Exception:
             time.sleep(0.5)
 
@@ -138,8 +118,10 @@ def generate_frames():
     frame_count = 0
 
     while True:
+        # Picamera2에서 프레임 캡처 후 BGR 컬러 변환
         frame = picam2.capture_array()
-        frame = cv2.flip(frame, -1)  # 상하좌우 반전 필요 시 조절
+        #frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        #frame = cv2.flip(frame, 0)
 
         frame_count += 1
 
@@ -167,7 +149,6 @@ def generate_frames():
 
                     detected_object = f"{label_name} ({confidence * 100:.0f}%)"
 
-                    # 물체가 20cm 이내 접근하고 AI 대상일 경우 동작
                     if current_distance <= 20.0 and label_name in TARGET_CLASSES:
                         found_target = True
                         ai_status = f"✅ {label_name} 인식 성공!"
@@ -188,7 +169,7 @@ def generate_frames():
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 # ==========================================
-# 7. Flask 웹 대시보드
+# 7. Flask 웹 모니터링 페이지
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -300,21 +281,3 @@ if __name__ == '__main__':
     finally:
         picam2.stop()
         GPIO.cleanup()
-
-
----
-
-## 3. 하드웨어 현장 점검 체크리스트 (수정 후 점검)
-
-1. **초음파 센서 VCC 핀 전원 확인**
-   - 초음파 센서 모듈의 **VCC 핀이 반드시 라즈베리파이 Pin 2번(5V)**에 연결되어 있는지 확인합니다. (3.3V에 꽂히면 초음파가 발사되지 않아 0.4cm로 고정됩니다.)
-2. **Trig / Echo 핀 교차 점검**
-   - **Trig ➡️ Pin 16 (BCM 23)**
-   - **Echo ➡️ Pin 18 (BCM 24)** (두 핀이 반대로 꽂히면 수치가 변하지 않습니다.)
-```eof
-
-### 🛠️ 하드웨어 필수 체크 포인트
-1. 초음파 센서의 **VCC 핀이 라즈베리파이 2번 핀(5V)**에 꽂혀 있는지 꼭 확인하세요. (1번 핀 3.3V에 꽂으면 0.4cm만 나옵니다.)
-2. 실행 시 `python3 app.py`를 실행하신 후 웹 페이지(`http://localhost:5000`) 접속 시 웹 버튼 **[🔔 부저 모듈 테스트]**를 클릭했을 때 소리가 정상적으로 나는지 확인하세요.
-
-추가로 작동 과정에서 막히는 점이 있으시면 알려주세요!

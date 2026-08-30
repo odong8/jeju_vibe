@@ -7,12 +7,12 @@ import RPi.GPIO as GPIO
 from picamera2 import Picamera2
 
 # ==========================================
-# 1. GPIO 핀 설정 (모듈 직접 연결)
+# 1. GPIO 핀 설정
 # ==========================================
 PIN_TRIG = 23
 PIN_ECHO = 24
-PIN_LED_GREEN = 17
-PIN_BUZZER = 18
+PIN_LED_GREEN = 17  # 경고등 LED
+PIN_BUZZER = 18     # 퇴치용 사이렌 부저
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
@@ -30,112 +30,143 @@ GPIO.output(PIN_BUZZER, GPIO.LOW)
 # ==========================================
 PROTOTXT = "models/deploy.prototxt"
 MODEL = "models/MobileNetSSD_deploy.caffemodel"
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.45  # 동물 인식을 위해 임계값 최적화
 
 CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
            "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
            "sofa", "train", "tvmonitor"]
 
-TARGET_CLASSES = ["bottle", "chair", "person"]  # 인식 대상
+# 생태 감시 및 퇴치 대상 (조류, 고양이, 개, 무단 침입자)
+TARGET_CLASSES = ["bird", "cat", "dog", "person"]
 
-print("[INFO] AI 모델 로딩 중...")
+print("[INFO] AI 생태 감시 모델 로딩 중...")
 net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
-print("[INFO] AI 모델 로딩 완료!")
+print("[INFO] AI 생태 감시 모델 로딩 완료!")
 
 # ==========================================
-# 3. 전역 변수 및 카메라 초기화 (Picamera2)
+# 3. 전역 상태 및 카메라 초기화
 # ==========================================
 app = Flask(__name__)
 
 current_distance = 0.0
 detected_object = "없음"
-ai_status = "대기 중..."
-last_detected_time = ""
+system_status = "🌿 안전 구역 (감시 중)"
+last_alert_time = "-"
+is_alerting = False
+latest_frame = None  # 고속 스트리밍 공유 프레임
 
-# Picamera2 초기화 및 설정
 picam2 = Picamera2()
-picam2.configure(picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"}))
+picam2.configure(picam2.create_video_configuration(main={"size": (400, 300), "format": "RGB888"}))
 picam2.start()
 
 # ==========================================
-# 4. 부저 & LED 모듈 제어 함수
+# 4. 부저 & LED 퇴치 제어 함수
 # ==========================================
 def beep(duration=0.1):
     GPIO.output(PIN_BUZZER, GPIO.HIGH)
     time.sleep(duration)
     GPIO.output(PIN_BUZZER, GPIO.LOW)
 
-def trigger_success_alert():
+def trigger_wildlife_deterrent():
+    global is_alerting, last_alert_time
+    if is_alerting:
+        return
+
     def alert_thread():
+        global is_alerting, last_alert_time
+        is_alerting = True
+        last_alert_time = time.strftime("%H:%M:%S")
+        
+        # 유해 동물 퇴치용 패턴 사이렌 (LED 점등 및 부저 3회 파동)
+        for _ in range(3):
+            GPIO.output(PIN_LED_GREEN, GPIO.HIGH)
+            beep(0.1)
+            GPIO.output(PIN_LED_GREEN, GPIO.LOW)
+            time.sleep(0.08)
+            
         GPIO.output(PIN_LED_GREEN, GPIO.HIGH)
-        beep(0.1)
-        time.sleep(0.1)
-        beep(0.1)
-        time.sleep(1.5)
+        time.sleep(0.8)
         GPIO.output(PIN_LED_GREEN, GPIO.LOW)
+        
+        time.sleep(1.5)  # 감지 재발동 쿨타임
+        is_alerting = False
+
     threading.Thread(target=alert_thread, daemon=True).start()
 
 # ==========================================
-# 5. 초음파 센서 모듈 측정 스레드
+# 5. 중앙값(Median) 필터 적용 정밀 초음파 스레드
 # ==========================================
+def measure_single_distance():
+    GPIO.output(PIN_TRIG, False)
+    time.sleep(0.000002)
+    GPIO.output(PIN_TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(PIN_TRIG, False)
+
+    pulse_start = time.time()
+    timeout = pulse_start + 0.025
+    while GPIO.input(PIN_ECHO) == 0:
+        pulse_start = time.time()
+        if pulse_start > timeout:
+            return None
+
+    pulse_end = time.time()
+    timeout = pulse_end + 0.025
+    while GPIO.input(PIN_ECHO) == 1:
+        pulse_end = time.time()
+        if pulse_end > timeout:
+            return None
+
+    duration = pulse_end - pulse_start
+    distance = (duration * 34300) / 2
+    if 2.0 <= distance <= 300.0:
+        return distance
+    return None
+
 def sensor_loop():
     global current_distance
     while True:
-        try:
-            GPIO.output(PIN_TRIG, True)
-            time.sleep(0.00001)
-            GPIO.output(PIN_TRIG, False)
+        samples = []
+        for _ in range(5):
+            d = measure_single_distance()
+            if d is not None:
+                samples.append(d)
+            time.sleep(0.01)
 
-            start_time = time.time()
-            stop_time = time.time()
+        if samples:
+            samples.sort()
+            median_dist = samples[len(samples) // 2]
+            current_distance = round(median_dist, 1)
 
-            timeout = start_time + 0.04
-            while GPIO.input(PIN_ECHO) == 0:
-                start_time = time.time()
-                if start_time > timeout:
-                    break
-
-            while GPIO.input(PIN_ECHO) == 1:
-                stop_time = time.time()
-                if stop_time > timeout:
-                    break
-
-            elapsed = stop_time - start_time
-            distance = (elapsed * 34300) / 2
-            current_distance = round(distance, 1)
-            time.sleep(0.2)
-        except Exception:
-            time.sleep(0.5)
+        time.sleep(0.1)
 
 threading.Thread(target=sensor_loop, daemon=True).start()
 
 # ==========================================
-# 6. AI 영상 처리 및 스트리밍 루프
+# 6. 고속 카메라 Capture 및 AI 감지 루프
 # ==========================================
-def generate_frames():
-    global detected_object, ai_status, last_detected_time
+def camera_ai_loop():
+    global latest_frame, detected_object, system_status
     frame_count = 0
 
     while True:
-        # Picamera2에서 프레임 캡처 후 BGR 컬러 변환
         frame = picam2.capture_array()
-        #frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        #frame = cv2.flip(frame, 0)
+        frame = cv2.flip(frame, -1)  # 상하좌우 반전
+        (h, w) = frame.shape[:2]
 
         frame_count += 1
-
+        # 매 2번째 프레임마다 AI 연산 실행하여 영상 속도 부드럽게 유지
         if frame_count % 2 == 0:
-            (h, w) = frame.shape[:2]
             blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
             net.setInput(blob)
             detections = net.forward()
 
             found_target = False
+            detected_object = "없음"
 
             for i in range(0, detections.shape[2]):
                 confidence = detections[0, 0, i, 2]
-
                 if confidence > CONFIDENCE_THRESHOLD:
                     idx = int(detections[0, 0, i, 1])
                     label_name = CLASSES[idx]
@@ -143,33 +174,43 @@ def generate_frames():
                     box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                     (startX, startY, endX, endY) = box.astype("int")
 
-                    cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
+                    # 바운딩 박스 표시 (동물/사람 감지 시 강조)
+                    color = (0, 0, 255) if label_name in TARGET_CLASSES else (0, 255, 0)
+                    cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
                     text = f"{label_name}: {confidence * 100:.1f}%"
-                    cv2.putText(frame, text, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.putText(frame, text, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
                     detected_object = f"{label_name} ({confidence * 100:.0f}%)"
 
-                    if current_distance <= 20.0 and label_name in TARGET_CLASSES:
+                    # 30cm 이내 접근 시 퇴치 작동
+                    if current_distance <= 30.0 and label_name in TARGET_CLASSES:
                         found_target = True
-                        ai_status = f"✅ {label_name} 인식 성공!"
-                        last_detected_time = time.strftime("%H:%M:%S")
-                        trigger_success_alert()
+                        system_status = f"🚨 경보! [{label_name}] 접근 탐지 (퇴치 작동)"
+                        trigger_wildlife_deterrent()
 
             if not found_target:
-                if current_distance <= 20.0:
-                    ai_status = "⚠️ 물체 감지됨 (분석 중...)"
+                if current_distance <= 30.0:
+                    system_status = "⚠️ 객체 접근 중 (분석 중...)"
                 else:
-                    ai_status = "대기 중 (용기를 다가오게 하세요)"
-                    detected_object = "없음"
+                    system_status = "🌿 안전 구역 (감시 중)"
 
         ret, buffer = cv2.imencode('.jpg', frame)
-        frame_bytes = buffer.tobytes()
+        if ret:
+            latest_frame = buffer.tobytes()
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.01)
+
+threading.Thread(target=camera_ai_loop, daemon=True).start()
+
+def generate_frames():
+    while True:
+        if latest_frame is not None:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + latest_frame + b'\r\n')
+        time.sleep(0.04)  # 25 FPS 웹 송출
 
 # ==========================================
-# 7. Flask 웹 모니터링 페이지
+# 7. Flask 웹 모니터링 대시보드
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -177,25 +218,25 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 스마트 재활용 모니터링</title>
+    <title>AI 스마트 생태 감시 대시보드</title>
     <style>
-        body { font-family: 'Noto Sans KR', sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; text-align: center; }
-        .container { max-width: 900px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        h1 { color: #2c3e50; margin-bottom: 5px; }
-        p.subtitle { color: #7f8c8d; font-size: 14px; margin-bottom: 20px; }
+        body { font-family: 'Noto Sans KR', sans-serif; background-color: #121824; color: white; margin: 0; padding: 20px; text-align: center; }
+        .container { max-width: 900px; margin: 0 auto; background: #1c2333; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.6); }
+        h1 { color: #2ecc71; margin-bottom: 5px; }
+        p.subtitle { color: #8a99ad; font-size: 14px; margin-bottom: 20px; }
         .main-content { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }
-        .video-box { flex: 1; min-width: 300px; background: #000; border-radius: 8px; overflow: hidden; }
+        .video-box { flex: 1.2; min-width: 320px; background: #000; border-radius: 8px; overflow: hidden; border: 2px solid #2c3a4e; }
         .video-box img { width: 100%; height: auto; display: block; }
         .status-box { flex: 1; min-width: 280px; text-align: left; display: flex; flex-direction: column; gap: 15px; }
-        .card { background: #eef2f5; padding: 15px; border-radius: 8px; border-left: 5px solid #3498db; }
-        .card.success { border-left-color: #2ecc71; background: #e8f8f5; }
-        .card h3 { margin: 0 0 8px 0; font-size: 14px; color: #555; }
-        .card p { margin: 0; font-size: 20px; font-weight: bold; color: #2c3e50; }
+        .card { background: #263248; padding: 15px; border-radius: 8px; border-left: 5px solid #2ecc71; }
+        .card.alert { border-left-color: #e74c3c; background: #342329; }
+        .card h3 { margin: 0 0 8px 0; font-size: 14px; color: #a0aec0; }
+        .card p { margin: 0; font-size: 20px; font-weight: bold; color: #ffffff; }
         .btn-group { display: flex; gap: 10px; margin-top: 15px; }
-        button { flex: 1; padding: 12px; font-size: 14px; font-weight: bold; color: white; background: #3498db; border: none; border-radius: 6px; cursor: pointer; }
-        button:hover { background: #2980b9; }
+        button { flex: 1; padding: 12px; font-size: 14px; font-weight: bold; color: white; background: #27ae60; border: none; border-radius: 6px; cursor: pointer; }
+        button:hover { background: #2ecc71; }
         button.btn-buzzer { background: #e67e22; }
-        button.btn-buzzer:hover { background: #d35400; }
+        button.btn-buzzer:hover { background: #f39c12; }
     </style>
     <script>
         function updateStatus() {
@@ -208,7 +249,7 @@ HTML_TEMPLATE = """
                     document.getElementById('time').innerText = data.last_time || '-';
                 });
         }
-        setInterval(updateStatus, 500);
+        setInterval(updateStatus, 300);
 
         function triggerLed() { fetch('/api/control/led'); }
         function triggerBuzzer() { fetch('/api/control/buzzer'); }
@@ -216,29 +257,29 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>♻️ AI 스마트 재활용 모니터링</h1>
+        <h1>🌿 AI 스마트 생태 감시 및 유해 동물 퇴치 시스템</h1>
         <p class="subtitle">제주 SW미래채움 - 라즈베리파이 AI 융합 프로젝트</p>
         <div class="main-content">
             <div class="video-box">
-                <img src="{{ url_for('video_feed') }}" alt="AI 카메라 실시간 스트리밍">
+                <img src="{{ url_for('video_feed') }}" alt="생태 실시간 스트리밍">
             </div>
             <div class="status-box">
                 <div class="card">
-                    <h3>📏 초음파 센서 거리</h3>
+                    <h3>📏 접근 동물/물체 거리</h3>
                     <p id="dist">0 cm</p>
                 </div>
                 <div class="card">
-                    <h3>🔍 AI 인식 사물</h3>
+                    <h3>🔍 AI 생물/객체 분류</h3>
                     <p id="obj">분석 중...</p>
                 </div>
-                <div class="card success">
-                    <h3>💡 AI 처리 상태</h3>
-                    <p id="status">대기 중...</p>
-                    <small style="color:#7f8c8d;">최근 인식 시간: <span id="time">-</span></small>
+                <div class="card alert">
+                    <h3>🚨 생태 감시 및 퇴치 상태</h3>
+                    <p id="status">감시 중...</p>
+                    <small style="color:#8a99ad;">최근 퇴치 작동 시간: <span id="time">-</span></small>
                 </div>
                 <div class="btn-group">
-                    <button onclick="triggerLed()">🟢 LED 모듈 테스트</button>
-                    <button class="btn-buzzer" onclick="triggerBuzzer()">🔔 부저 모듈 테스트</button>
+                    <button onclick="triggerLed()">🟢 경고등 점검</button>
+                    <button class="btn-buzzer" onclick="triggerBuzzer()">🔔 퇴치 사이렌 점검</button>
                 </div>
             </div>
         </div>
@@ -260,13 +301,13 @@ def api_status():
     return jsonify({
         'distance': current_distance,
         'object': detected_object,
-        'status': ai_status,
-        'last_time': last_detected_time
+        'status': system_status,
+        'last_time': last_alert_time
     })
 
 @app.route('/api/control/led')
 def control_led():
-    trigger_success_alert()
+    trigger_wildlife_deterrent()
     return jsonify({'result': 'success'})
 
 @app.route('/api/control/buzzer')
@@ -276,7 +317,7 @@ def control_buzzer():
 
 if __name__ == '__main__':
     try:
-        print("[INFO] 웹 서버 시작: http://0.0.0.0:5000")
+        print("[INFO] AI 생태 감시 웹 서버 시작: http://0.0.0.0:5000")
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     finally:
         picam2.stop()

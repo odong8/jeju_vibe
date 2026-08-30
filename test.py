@@ -37,11 +37,12 @@ CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
            "sofa", "train", "tvmonitor"]
 
-TARGET_CLASSES = ["bird", "cat", "dog", "person"]
+# 사람(person)을 제외하고 동물(bird, cat, dog)만 퇴치 대상으로 지정
+TARGET_CLASSES = ["bird", "cat", "dog"]
 
-print("[INFO] AI 생태 감시 모델 로딩 중...")
+print("[INFO] AI 야생 동물 감시 모델 로딩 중...")
 net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
-print("[INFO] AI 생태 감시 모델 로딩 완료!")
+print("[INFO] AI 야생 동물 감시 모델 로딩 완료!")
 
 # ==========================================
 # 3. 전역 공유 변수 및 카메라 설정
@@ -50,7 +51,7 @@ app = Flask(__name__)
 
 current_distance = 0.0
 detected_object = "없음"
-system_status = "🌿 안전 구역 (감시 중)"
+system_status = "🌿 안전 구역 (동물 감시 중)"
 last_alert_time = "-"
 is_alerting = False
 
@@ -133,7 +134,7 @@ def sensor_loop():
     global current_distance
     while True:
         samples = []
-        for _ in range(3):  # 3회 초고속 측정
+        for _ in range(3):
             d = measure_single_distance()
             if d is not None:
                 samples.append(d)
@@ -143,7 +144,7 @@ def sensor_loop():
             samples.sort()
             current_distance = round(samples[len(samples) // 2], 1)
 
-        time.sleep(0.03)  # 0.03초 주기 갱신
+        time.sleep(0.03)
 
 threading.Thread(target=sensor_loop, daemon=True).start()
 
@@ -191,31 +192,37 @@ def ai_inference_loop():
                     box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                     (startX, startY, endX, endY) = box.astype("int")
 
-                    color = (0, 0, 255) if label_name in TARGET_CLASSES else (0, 255, 0)
+                    # target_classes (bird, cat, dog)인 경우만 빨간 박스로 표시 및 퇴치 작동
+                    if label_name in TARGET_CLASSES:
+                        color = (0, 0, 255)  # 빨간색 (퇴치 대상)
+                    else:
+                        color = (0, 255, 0)  # 초록색 (일반 물체/사람)
+
                     cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
                     text = f"{label_name}: {confidence * 100:.1f}%"
                     cv2.putText(frame, text, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
                     curr_obj = f"{label_name} ({confidence * 100:.0f}%)"
 
+                    # 30cm 이내 접근 + 동물이 감지된 경우에만 사이렌 작동
                     if current_distance <= 30.0 and label_name in TARGET_CLASSES:
                         found_target = True
-                        system_status = f"🚨 경보! [{label_name}] 접근 탐지 (퇴치 작동)"
+                        system_status = f"🚨 경보! 유해 동물 [{label_name}] 접근 탐지 (퇴치 작동)"
                         trigger_wildlife_deterrent()
 
             detected_object = curr_obj
 
             if not found_target:
                 if current_distance <= 30.0:
-                    system_status = "⚠️ 객체 접근 중 (분석 중...)"
+                    system_status = "⚠️ 객체/사람 접근 중 (동물 여부 분석 중...)"
                 else:
-                    system_status = "🌿 안전 구역 (감시 중)"
+                    system_status = "🌿 안전 구역 (동물 감시 중)"
 
             ret, buffer = cv2.imencode('.jpg', frame)
             if ret:
                 latest_processed_frame = buffer.tobytes()
 
-        time.sleep(0.03)  # AI 분석 주기
+        time.sleep(0.03)
 
 threading.Thread(target=ai_inference_loop, daemon=True).start()
 
@@ -227,7 +234,7 @@ def generate_frames():
         time.sleep(0.03)
 
 # ==========================================
-# 8. Flask 웹 모니터링 대시보드 (100ms 반응속도)
+# 8. Flask 웹 모니터링 대시보드
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -266,7 +273,7 @@ HTML_TEMPLATE = """
                     document.getElementById('time').innerText = data.last_time || '-';
                 });
         }
-        setInterval(updateStatus, 100); // 0.1초 고속 업데이트
+        setInterval(updateStatus, 100);
 
         function triggerLed() { fetch('/api/control/led'); }
         function triggerBuzzer() { fetch('/api/control/buzzer'); }
@@ -334,7 +341,7 @@ def control_buzzer():
 
 if __name__ == '__main__':
     try:
-        print("[INFO] AI 생태 감시 고속 웹 서버 시작: http://0.0.0.0:5000")
+        print("[INFO] AI 야생 동물 감시 고속 웹 서버 시작: [http://0.0.0.0:5000](http://0.0.0.0:5000)")
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     finally:
         picam2.stop()

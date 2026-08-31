@@ -1,9 +1,3 @@
-nohup ffmpeg -f x11grab -framerate 20 -video_size 1280x720 -i :0.0 -c:v libx264 -preset ultrafast -crf 28 record_output.mp4 > /dev/null 2>&1 &
-
-killall ffmpeg
-
-
-
 import cv2
 import numpy as np
 import time
@@ -43,22 +37,22 @@ servo_pwm.start(0)
 # ==========================================
 PROTOTXT = "models/deploy.prototxt"
 MODEL = "models/MobileNetSSD_deploy.caffemodel"
-CONFIDENCE_THRESHOLD = 0.45  # 오인식 방지를 위해 0.45로 설정
+CONFIDENCE_THRESHOLD = 0.45
 
 CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
            "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
            "sofa", "train", "tvmonitor"]
 
-# 퇴치 대상 동물 (조류, 고양이, 개)
-ANIMAL_CLASSES = ["bird", "cat", "dog"]
+# 퇴치 대상 동물 (조류, 고양이, 개, 말 추가)
+ANIMAL_CLASSES = ["bird", "cat", "dog", "horse"]
 
 print("[INFO] AI 야생 동물 및 사람 감지 모델 로딩 중...")
 net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
 print("[INFO] AI 모델 로딩 완료!")
 
 # ==========================================
-# 3. 전역 공유 변수 및 카메라 설정
+# 3. 전역 공유 변수, 감지 이력(Log) 및 카메라 설정
 # ==========================================
 app = Flask(__name__)
 
@@ -68,8 +62,11 @@ system_status = "🌿 안전 구역 (감시 중)"
 last_alert_time = "-"
 is_alerting = False
 
-latest_raw_frame = None  # 원본 캡처 프레임
-latest_processed_frame = None  # AI 결과 오버레이 프레임
+# [신규 추가] 위험 발동 내역 저장용 리스트 (최대 50개 보관)
+event_logs = []  # 데이터 형태: {"time": "14:20:15", "animal": "bird", "distance": 32.5}
+
+latest_raw_frame = None
+latest_processed_frame = None
 frame_lock = threading.Lock()
 
 picam2 = Picamera2()
@@ -83,7 +80,7 @@ def beep_pwm(duration=0.1, freq=2700):
     """3핀 수동 부저 모듈 PWM 제어 함수"""
     try:
         pwm = GPIO.PWM(PIN_BUZZER, freq)
-        pwm.start(50)  # Duty Cycle 50%
+        pwm.start(50)
         time.sleep(duration)
         pwm.stop()
     except Exception:
@@ -92,33 +89,51 @@ def beep_pwm(duration=0.1, freq=2700):
 def move_scarecrow():
     """허수아비를 좌우로 회전시키는 서보모터 구동 함수"""
     try:
-        # 0도 -> 180도 -> 0도 왕복 동작 (DutyCycle: 2.5% ~ 12.5%)
         for _ in range(2):
-            servo_pwm.ChangeDutyCycle(2.5)   # 0도 (좌측)
+            servo_pwm.ChangeDutyCycle(2.5)   # 0도
             time.sleep(0.25)
-            servo_pwm.ChangeDutyCycle(12.5)  # 180도 (우측)
+            servo_pwm.ChangeDutyCycle(12.5)  # 180도
             time.sleep(0.25)
         
-        servo_pwm.ChangeDutyCycle(7.5)   # 90도 (정면 원위치)
+        servo_pwm.ChangeDutyCycle(7.5)   # 90도 (원위치)
         time.sleep(0.2)
-        servo_pwm.ChangeDutyCycle(0)     # 신호 차단 (서보 떨림 방지)
+        servo_pwm.ChangeDutyCycle(0)     # 떨림 방지
     except Exception as e:
         print(f"[SERVO ERROR] {e}")
 
-def trigger_wildlife_deterrent():
-    global is_alerting, last_alert_time
+def add_event_log(animal_name, dist):
+    """웹 기록용 로그 추가 함수"""
+    global last_alert_time
+    now_str = time.strftime("%H:%M:%S")
+    last_alert_time = now_str
+    
+    log_entry = {
+        "time": now_str,
+        "animal": animal_name,
+        "distance": dist
+    }
+    
+    # 최신 기록이 맨 위로 오도록 삽입
+    event_logs.insert(0, log_entry)
+    if len(event_logs) > 50:
+        event_logs.pop()
+
+def trigger_wildlife_deterrent(animal_name="미상"):
+    global is_alerting
     if is_alerting:
         return
 
+    # 실시간 이력 기록
+    add_event_log(animal_name, current_distance)
+
     def alert_thread():
-        global is_alerting, last_alert_time
+        global is_alerting
         is_alerting = True
-        last_alert_time = time.strftime("%H:%M:%S")
         
-        # 1. 서보모터 허수아비 회전 동작 (별도 스레드 동시 실행)
+        # 1. 서보모터 허수아비 회전 동작
         threading.Thread(target=move_scarecrow, daemon=True).start()
 
-        # 2. LED 및 3핀 수동 부저 고음량 경고음 동시 작동
+        # 2. LED 및 3핀 수동 부저 사이렌 작동
         for _ in range(3):
             GPIO.output(PIN_LED_GREEN, GPIO.HIGH)
             beep_pwm(0.1, 2700)
@@ -135,7 +150,7 @@ def trigger_wildlife_deterrent():
     threading.Thread(target=alert_thread, daemon=True).start()
 
 # ==========================================
-# 5. 초고속 반응 초음파 센서 스레드
+# 5. 초음파 센서 스레드
 # ==========================================
 def measure_single_distance():
     GPIO.output(PIN_TRIG, False)
@@ -183,13 +198,12 @@ def sensor_loop():
 threading.Thread(target=sensor_loop, daemon=True).start()
 
 # ==========================================
-# 6. 실시간 카메라 Capturing 스레드 (30 FPS 고속)
+# 6. 실시간 카메라 Capturing 스레드
 # ==========================================
 def camera_capture_loop():
     global latest_raw_frame
     while True:
         frame = picam2.capture_array()
-        # frame = cv2.flip(frame, -1)
         with frame_lock:
             latest_raw_frame = frame.copy()
         time.sleep(0.01)
@@ -197,7 +211,7 @@ def camera_capture_loop():
 threading.Thread(target=camera_capture_loop, daemon=True).start()
 
 # ==========================================
-# 7. 비동기 AI 추론 백그라운드 스레드 (사람 예외 처리 적용)
+# 7. 비동기 AI 추론 스레드
 # ==========================================
 def ai_inference_loop():
     global latest_processed_frame, detected_object, system_status
@@ -228,7 +242,6 @@ def ai_inference_loop():
                     box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                     (startX, startY, endX, endY) = box.astype("int")
 
-                    # 1. 사람 감지 시 (주황색 박스 & 경보/허수아비 차단 플래그 설정)
                     if label_name == "person":
                         person_detected = True
                         color = (255, 165, 0)
@@ -237,7 +250,6 @@ def ai_inference_loop():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         curr_obj = f"person ({confidence * 100:.0f}%)"
 
-                    # 2. 동물 감지 시 (빨간색 박스)
                     elif label_name in ANIMAL_CLASSES:
                         animal_detected = True
                         detected_animal_name = label_name
@@ -247,7 +259,6 @@ def ai_inference_loop():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         curr_obj = f"{label_name} ({confidence * 100:.0f}%)"
 
-                    # 3. 기타 일반 사물 (초록색 박스)
                     else:
                         color = (0, 255, 0)
                         cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
@@ -257,19 +268,14 @@ def ai_inference_loop():
 
             detected_object = curr_obj
 
-            # --- 경보 및 허수아비 제어 핵심 로직 ---
-            # 1. 사람이 카메라 화면에 감지되면 무조건 경보/허수아비 작동 차단 (사람 보호)
+            # [요구사항 반영] 거리 기준 50.0cm 적용
             if person_detected:
                 system_status = "👤 사람 감지됨 (안전)"
-            
-            # 2. 사람이 없고, 30cm 이내에 동물이 다가온 경우 3단 퇴치 작동 (LED + 부저 + 허수아비)
-            elif animal_detected and current_distance <= 30.0:
+            elif animal_detected and current_distance <= 50.0:
                 system_status = f"🚨 경보! 유해 동물 [{detected_animal_name}] 접근 탐지 (허수아비&사이렌 작동)"
-                trigger_wildlife_deterrent()
-
-            # 3. 그 외 기본 상태
+                trigger_wildlife_deterrent(detected_animal_name)
             else:
-                if current_distance <= 30.0:
+                if current_distance <= 50.0:
                     system_status = "⚠️ 물체/사람 접근 중 (감시 중...)"
                 else:
                     system_status = "🌿 안전 구역 (동물 감시 중)"
@@ -290,7 +296,7 @@ def generate_frames():
         time.sleep(0.03)
 
 # ==========================================
-# 8. Flask 웹 모니터링 대시보드
+# 8. Flask 웹 대시보드 (데이터 기록 테이블 구현)
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -298,27 +304,35 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 스마트 생태 감시 대시보드</title>
+    <title>지능형 허수아비 철통 경계 시스템</title>
     <style>
         body { font-family: 'Noto Sans KR', sans-serif; background-color: #121824; color: white; margin: 0; padding: 20px; text-align: center; }
-        .container { max-width: 900px; margin: 0 auto; background: #1c2333; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.6); }
+        .container { max-width: 950px; margin: 0 auto; background: #1c2333; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.6); }
         h1 { color: #2ecc71; margin-bottom: 5px; }
         p.subtitle { color: #8a99ad; font-size: 14px; margin-bottom: 20px; }
-        .main-content { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }
+        .main-content { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; margin-bottom: 25px; }
         .video-box { flex: 1.2; min-width: 320px; background: #000; border-radius: 8px; overflow: hidden; border: 2px solid #2c3a4e; }
         .video-box img { width: 100%; height: auto; display: block; }
-        .status-box { flex: 1; min-width: 280px; text-align: left; display: flex; flex-direction: column; gap: 15px; }
-        .card { background: #263248; padding: 15px; border-radius: 8px; border-left: 5px solid #2ecc71; }
+        .status-box { flex: 1; min-width: 280px; text-align: left; display: flex; flex-direction: column; gap: 12px; }
+        .card { background: #263248; padding: 12px 15px; border-radius: 8px; border-left: 5px solid #2ecc71; }
         .card.alert { border-left-color: #e74c3c; background: #342329; }
-        .card h3 { margin: 0 0 8px 0; font-size: 14px; color: #a0aec0; }
-        .card p { margin: 0; font-size: 20px; font-weight: bold; color: #ffffff; }
-        .btn-group { display: flex; gap: 10px; margin-top: 15px; }
-        button { flex: 1; padding: 12px; font-size: 14px; font-weight: bold; color: white; background: #27ae60; border: none; border-radius: 6px; cursor: pointer; }
+        .card h3 { margin: 0 0 5px 0; font-size: 13px; color: #a0aec0; }
+        .card p { margin: 0; font-size: 18px; font-weight: bold; color: #ffffff; }
+        
+        /* 웹 기록 데이터 테이블 스타일 */
+        .log-section { text-align: left; background: #263248; padding: 15px; border-radius: 8px; }
+        .log-section h2 { margin-top: 0; font-size: 16px; color: #2ecc71; border-bottom: 1px solid #3a4b68; padding-bottom: 8px; }
+        .table-wrapper { max-height: 180px; overflow-y: auto; }
+        table { width: 100%; border-collapse: collapse; text-align: center; font-size: 13px; }
+        th { background: #1c2333; color: #8a99ad; padding: 8px; position: sticky; top: 0; }
+        td { padding: 8px; border-bottom: 1px solid #313e56; }
+        .tag-animal { color: #e74c3c; font-weight: bold; }
+        
+        .btn-group { display: flex; gap: 10px; margin-top: 5px; }
+        button { flex: 1; padding: 10px; font-size: 13px; font-weight: bold; color: white; background: #27ae60; border: none; border-radius: 6px; cursor: pointer; }
         button:hover { background: #2ecc71; }
         button.btn-buzzer { background: #e67e22; }
-        button.btn-buzzer:hover { background: #f39c12; }
         button.btn-servo { background: #2980b9; }
-        button.btn-servo:hover { background: #3498db; }
     </style>
     <script>
         function updateStatus() {
@@ -329,9 +343,24 @@ HTML_TEMPLATE = """
                     document.getElementById('obj').innerText = data.object;
                     document.getElementById('status').innerText = data.status;
                     document.getElementById('time').innerText = data.last_time || '-';
+                    
+                    // 위험 발동 내역 테이블 실시간 업데이트
+                    let logRows = '';
+                    if (data.logs.length === 0) {
+                        logRows = '<tr><td colspan="3">최근 위험 발동 기록이 없습니다.</td></tr>';
+                    } else {
+                        data.logs.forEach(log => {
+                            logRows += `<tr>
+                                <td>${log.time}</td>
+                                <td><span class="tag-animal">${log.animal}</span></td>
+                                <td>${log.distance} cm</td>
+                            </tr>`;
+                        });
+                    }
+                    document.getElementById('log-tbody').innerHTML = logRows;
                 });
         }
-        setInterval(updateStatus, 100);
+        setInterval(updateStatus, 500);
 
         function triggerLed() { fetch('/api/control/led'); }
         function triggerBuzzer() { fetch('/api/control/buzzer'); }
@@ -340,31 +369,50 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>🌿 AI 스마트 생태 감시 및 유해 동물 퇴치 시스템</h1>
-        <p class="subtitle">제주 SW미래채움 - 라즈베리파이 AI 융합 프로젝트</p>
+        <h1>🌾 지능형 허수아비의 철통 경계 근무</h1>
+        <p class="subtitle">AI 영상분석 & 초음파 복합 제어 실시간 대시보드</p>
         <div class="main-content">
             <div class="video-box">
-                <img src="{{ url_for('video_feed') }}" alt="생태 실시간 스트리밍">
+                <img src="{{ url_for('video_feed') }}" alt="실시간 카메라 스트리밍">
             </div>
             <div class="status-box">
                 <div class="card">
-                    <h3>📏 접근 동물/물체 거리</h3>
+                    <h3>📏 접근 감지 거리 (기준: 50cm 이내)</h3>
                     <p id="dist">0 cm</p>
                 </div>
                 <div class="card">
-                    <h3>🔍 AI 생물/객체 분류</h3>
+                    <h3>🔍 AI 실시간 식별 객체</h3>
                     <p id="obj">분석 중...</p>
                 </div>
                 <div class="card alert">
-                    <h3>🚨 생태 감시 및 퇴치 상태</h3>
+                    <h3>🚨 현재 시스템 동작 상태</h3>
                     <p id="status">감시 중...</p>
-                    <small style="color:#8a99ad;">최근 퇴치 작동 시간: <span id="time">-</span></small>
+                    <small style="color:#8a99ad;">최근 퇴치 작동: <span id="time">-</span></small>
                 </div>
                 <div class="btn-group">
                     <button onclick="triggerLed()">🟢 경고등</button>
                     <button class="btn-buzzer" onclick="triggerBuzzer()">🔔 사이렌</button>
                     <button class="btn-servo" onclick="triggerScarecrow()">🤖 허수아비</button>
                 </div>
+            </div>
+        </div>
+
+        <!-- 요구사항: 웹 기반 위험 발동 내역 실시간 데이터 기록 -->
+        <div class="log-section">
+            <h2>📋 실시간 위험 발동 및 유해 동물 감지 이력</h2>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>발동 시간</th>
+                            <th>감지된 동물종</th>
+                            <th>접근 거리</th>
+                        </tr>
+                    </thead>
+                    <tbody id="log-tbody">
+                        <tr><td colspan="3">데이터 로딩 중...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -386,12 +434,13 @@ def api_status():
         'distance': current_distance,
         'object': detected_object,
         'status': system_status,
-        'last_time': last_alert_time
+        'last_time': last_alert_time,
+        'logs': event_logs  # 누적된 이벤트 로그 반환
     })
 
 @app.route('/api/control/led')
 def control_led():
-    trigger_wildlife_deterrent()
+    trigger_wildlife_deterrent("수동 제어")
     return jsonify({'result': 'success'})
 
 @app.route('/api/control/buzzer')
@@ -406,7 +455,7 @@ def control_scarecrow():
 
 if __name__ == '__main__':
     try:
-        print("[INFO] AI 야생 동물 감시 고속 웹 서버 시작: [http://0.0.0.0:5000](http://0.0.0.0:5000)")
+        print("[INFO] 지능형 허수아비 경계 시스템 웹 서버 시작: http://0.0.0.0:5000")
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     finally:
         servo_pwm.stop()

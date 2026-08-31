@@ -1,3 +1,9 @@
+nohup ffmpeg -f x11grab -framerate 20 -video_size 1280x720 -i :0.0 -c:v libx264 -preset ultrafast -crf 28 record_output.mp4 > /dev/null 2>&1 &
+
+killall ffmpeg
+
+
+
 import cv2
 import numpy as np
 import time

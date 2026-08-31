@@ -1,37 +1,8 @@
-bash
-
-# 1. 타임존을 대한민국(Asia/Seoul)으로 설정
-sudo timedatectl set-timezone Asia/Seoul
-
-# 2. 시간 동기화(NTP) 서비스 활성화 및 즉시 동기화
-sudo timedatectl set-ntp true
-sudo systemctl restart systemd-timesyncd
-
-# 3. 현재 설정된 시간 확인 (Local time과 System clock synchronized: yes 확인)
-date
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import cv2
 import numpy as np
 import time
 import threading
+from datetime import datetime, timedelta, timezone  # 한국 표준시(KST) 적용을 위한 모듈
 from flask import Flask, render_template_string, Response, jsonify
 import RPi.GPIO as GPIO
 from picamera2 import Picamera2
@@ -74,7 +45,7 @@ CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
            "sofa", "train", "tvmonitor"]
 
-# 퇴치 대상 동물 (조류, 고양이, 개, 말 추가)
+# 퇴치 대상 동물 (조류, 고양이, 개, 말)
 ANIMAL_CLASSES = ["bird", "cat", "dog", "horse"]
 
 print("[INFO] AI 야생 동물 및 사람 감지 모델 로딩 중...")
@@ -82,9 +53,16 @@ net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
 print("[INFO] AI 모델 로딩 완료!")
 
 # ==========================================
-# 3. 전역 공유 변수, 감지 이력(Log) 및 카메라 설정
+# 3. 전역 공유 변수, 시간 설정 및 카메라 초기화
 # ==========================================
 app = Flask(__name__)
+
+# 한국 표준시 (KST = UTC+9) 고정 설정
+KST = timezone(timedelta(hours=9))
+
+def get_kst_now_str():
+    """OS 시간 오차 방지를 위해 한국 표준시(KST)를 HH:MM:SS 규격으로 취득"""
+    return datetime.now(KST).strftime("%H:%M:%S")
 
 current_distance = 0.0
 detected_object = "없음"
@@ -92,8 +70,8 @@ system_status = "🌿 안전 구역 (감시 중)"
 last_alert_time = "-"
 is_alerting = False
 
-# [신규 추가] 위험 발동 내역 저장용 리스트 (최대 50개 보관)
-event_logs = []  # 데이터 형태: {"time": "14:20:15", "animal": "bird", "distance": 32.5}
+# 위험 발동 내역 저장용 리스트 (최대 50개 저장)
+event_logs = []
 
 latest_raw_frame = None
 latest_processed_frame = None
@@ -120,21 +98,21 @@ def move_scarecrow():
     """허수아비를 좌우로 회전시키는 서보모터 구동 함수"""
     try:
         for _ in range(2):
-            servo_pwm.ChangeDutyCycle(2.5)   # 0도
+            servo_pwm.ChangeDutyCycle(2.5)   # 0도 (좌)
             time.sleep(0.25)
-            servo_pwm.ChangeDutyCycle(12.5)  # 180도
+            servo_pwm.ChangeDutyCycle(12.5)  # 180도 (우)
             time.sleep(0.25)
         
-        servo_pwm.ChangeDutyCycle(7.5)   # 90도 (원위치)
+        servo_pwm.ChangeDutyCycle(7.5)   # 90도 (정면 원위치)
         time.sleep(0.2)
-        servo_pwm.ChangeDutyCycle(0)     # 떨림 방지
+        servo_pwm.ChangeDutyCycle(0)     # 모터 떨림/발열 방지
     except Exception as e:
         print(f"[SERVO ERROR] {e}")
 
 def add_event_log(animal_name, dist):
-    """웹 기록용 로그 추가 함수"""
+    """KST 기반 정확한 시각을 로그 및 웹 대시보드에 기록"""
     global last_alert_time
-    now_str = time.strftime("%H:%M:%S")
+    now_str = get_kst_now_str()
     last_alert_time = now_str
     
     log_entry = {
@@ -143,8 +121,7 @@ def add_event_log(animal_name, dist):
         "distance": dist
     }
     
-    # 최신 기록이 맨 위로 오도록 삽입
-    event_logs.insert(0, log_entry)
+    event_logs.insert(0, log_entry)  # 최신 로그를 맨 위에 추가
     if len(event_logs) > 50:
         event_logs.pop()
 
@@ -153,14 +130,14 @@ def trigger_wildlife_deterrent(animal_name="미상"):
     if is_alerting:
         return
 
-    # 실시간 이력 기록
+    # 정확한 시간으로 이력 기록 추가
     add_event_log(animal_name, current_distance)
 
     def alert_thread():
         global is_alerting
         is_alerting = True
         
-        # 1. 서보모터 허수아비 회전 동작
+        # 1. 서보모터 허수아비 회전 (독립 스레드)
         threading.Thread(target=move_scarecrow, daemon=True).start()
 
         # 2. LED 및 3핀 수동 부저 사이렌 작동
@@ -241,7 +218,7 @@ def camera_capture_loop():
 threading.Thread(target=camera_capture_loop, daemon=True).start()
 
 # ==========================================
-# 7. 비동기 AI 추론 스레드
+# 7. 비동기 AI 추론 백그라운드 스레드
 # ==========================================
 def ai_inference_loop():
     global latest_processed_frame, detected_object, system_status
@@ -298,7 +275,7 @@ def ai_inference_loop():
 
             detected_object = curr_obj
 
-            # [요구사항 반영] 거리 기준 50.0cm 적용
+            # 50.0cm 접근 거리 기준 및 안전 제어 로직
             if person_detected:
                 system_status = "👤 사람 감지됨 (안전)"
             elif animal_detected and current_distance <= 50.0:
@@ -326,7 +303,7 @@ def generate_frames():
         time.sleep(0.03)
 
 # ==========================================
-# 8. Flask 웹 대시보드 (데이터 기록 테이블 구현)
+# 8. Flask 웹 대시보드
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -349,7 +326,7 @@ HTML_TEMPLATE = """
         .card h3 { margin: 0 0 5px 0; font-size: 13px; color: #a0aec0; }
         .card p { margin: 0; font-size: 18px; font-weight: bold; color: #ffffff; }
         
-        /* 웹 기록 데이터 테이블 스타일 */
+        /* 기록 데이터 테이블 스타일 */
         .log-section { text-align: left; background: #263248; padding: 15px; border-radius: 8px; }
         .log-section h2 { margin-top: 0; font-size: 16px; color: #2ecc71; border-bottom: 1px solid #3a4b68; padding-bottom: 8px; }
         .table-wrapper { max-height: 180px; overflow-y: auto; }
@@ -374,7 +351,6 @@ HTML_TEMPLATE = """
                     document.getElementById('status').innerText = data.status;
                     document.getElementById('time').innerText = data.last_time || '-';
                     
-                    // 위험 발동 내역 테이블 실시간 업데이트
                     let logRows = '';
                     if (data.logs.length === 0) {
                         logRows = '<tr><td colspan="3">최근 위험 발동 기록이 없습니다.</td></tr>';
@@ -427,7 +403,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- 요구사항: 웹 기반 위험 발동 내역 실시간 데이터 기록 -->
         <div class="log-section">
             <h2>📋 실시간 위험 발동 및 유해 동물 감지 이력</h2>
             <div class="table-wrapper">
@@ -465,7 +440,7 @@ def api_status():
         'object': detected_object,
         'status': system_status,
         'last_time': last_alert_time,
-        'logs': event_logs  # 누적된 이벤트 로그 반환
+        'logs': event_logs
     })
 
 @app.route('/api/control/led')

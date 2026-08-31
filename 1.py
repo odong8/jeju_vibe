@@ -1,3 +1,33 @@
+bash
+
+# 1. 타임존을 대한민국(Asia/Seoul)으로 설정
+sudo timedatectl set-timezone Asia/Seoul
+
+# 2. 시간 동기화(NTP) 서비스 활성화 및 즉시 동기화
+sudo timedatectl set-ntp true
+sudo systemctl restart systemd-timesyncd
+
+# 3. 현재 설정된 시간 확인 (Local time과 System clock synchronized: yes 확인)
+date
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import cv2
 import numpy as np
 import time
